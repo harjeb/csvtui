@@ -1,0 +1,19 @@
+/target
+
+# IDE / editor metadata
+/.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Backups & swap files
+*.swp
+*.swo
+*~
+**/*.rs.bk
+
+# Coverage and profiling
+*.profraw
+coverage/
