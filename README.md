@@ -1,6 +1,6 @@
-# tuidemo
+# csvtui
 
-`tuidemo` is an interactive terminal UI for exploring CSV files. It renders tabular data with smooth keyboard navigation and includes multiple chart visualizations powered by [Ratatui] and [crossterm].
+`csvtui` is an interactive terminal UI for exploring CSV files. It renders tabular data with smooth keyboard navigation and includes multiple chart visualizations powered by [Ratatui] and [crossterm].
 
 [Ratatui]: https://ratatui.rs
 [crossterm]: https://crates.io/crates/crossterm
