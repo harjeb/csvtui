@@ -1,5 +1,5 @@
 /target
-
+./github/workflows/ci.yml
 # IDE / editor metadata
 /.idea/
 .vscode/
