@@ -712,7 +712,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tuidemo"
+name = "csvtui"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
