@@ -15,11 +15,9 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        canvas::{
-            Canvas, Circle, Context as CanvasContext, Line as CanvasLine, Painter, Shape,
-        },
         Axis, Bar, BarChart, BarGroup, Block, Cell, Chart, Dataset, GraphType, Paragraph, Row,
         Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+        canvas::{Canvas, Context as CanvasContext, Painter, Shape},
     },
 };
 
@@ -228,7 +226,11 @@ impl App {
             let cells = visible_columns
                 .iter()
                 .map(|&idx| {
-                    let header = self.headers.get(idx).map(String::as_str).unwrap_or_default();
+                    let header = self
+                        .headers
+                        .get(idx)
+                        .map(String::as_str)
+                        .unwrap_or_default();
                     let indicator = match (self.sort_column, self.sort_ascending) {
                         (Some(col), true) if col == idx => " ^",
                         (Some(col), false) if col == idx => " v",
@@ -531,39 +533,39 @@ impl App {
             return;
         }
 
-        let legend_height = entries.len().min(inner.height.saturating_sub(5) as usize) as u16;
-        let layout = if inner.height > legend_height + 4 {
-            Layout::vertical([
-                Constraint::Length(inner.height - legend_height),
-                Constraint::Length(legend_height.max(3)),
-            ])
-            .split(inner)
-        } else {
-            Layout::vertical([Constraint::Min(inner.height), Constraint::Length(0)]).split(inner)
-        };
+        let layout = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(inner);
 
         let pie_area = layout[0];
-        let legend_area = layout[1];
+        let legend_area = layout.get(1).copied().unwrap_or(Rect {
+            x: pie_area.x,
+            y: pie_area.y,
+            width: 0,
+            height: 0,
+        });
 
+        let pie_rect = pie_area;
         let canvas = Canvas::default()
-            .marker(symbols::Marker::Block)
+            .marker(symbols::Marker::Dot)
             .x_bounds([-1.2, 1.2])
             .y_bounds([-1.2, 1.2])
-            .paint(|ctx| draw_pie(ctx, &entries));
+            .paint(|ctx| draw_pie(ctx, &entries, pie_rect));
         frame.render_widget(canvas, pie_area);
 
         if legend_area.height > 0 && legend_area.width > 0 {
             let legend_lines = entries
                 .iter()
                 .map(|entry| {
+                    let percent = (entry.fraction * 100.0).round() as u64;
+                    let label = truncate_label(&entry.label, 18);
                     Line::from(vec![
                         Span::styled(
-                            format!("{:>3}% ", (entry.fraction * 100.0).round() as u64),
+                            "[] ",
                             Style::default()
                                 .fg(entry.color)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(format!("{} ({})", entry.label, entry.count)),
+                        Span::raw(format!("{:<18} {:>3}% ({})", label, percent, entry.count)),
                     ])
                 })
                 .collect::<Vec<_>>();
@@ -571,7 +573,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(legend_lines)
                     .wrap(Wrap { trim: true })
-                    .block(Block::default().title("Legend")),
+                    .block(Block::default().title("Data")),
                 legend_area,
             );
         }
@@ -839,8 +841,7 @@ impl App {
         }
 
         for offset in 0..=target {
-            if Self::visible_columns_from_offset(offset, column_widths, available)
-                .contains(&target)
+            if Self::visible_columns_from_offset(offset, column_widths, available).contains(&target)
             {
                 self.column_offset = offset;
                 return;
@@ -857,9 +858,10 @@ impl App {
 
         let available = area_width.saturating_sub(2);
         if available == 0 {
-            return vec![self
-                .column_offset
-                .min(column_widths.len().saturating_sub(1))];
+            return vec![
+                self.column_offset
+                    .min(column_widths.len().saturating_sub(1)),
+            ];
         }
 
         Self::visible_columns_from_offset(self.column_offset, column_widths, available)
@@ -989,46 +991,88 @@ impl PieEntry {
     }
 }
 
-fn draw_pie(ctx: &mut CanvasContext<'_>, entries: &[PieEntry]) {
+fn draw_pie(ctx: &mut CanvasContext<'_>, entries: &[PieEntry], area: Rect) {
     if entries.is_empty() {
         return;
     }
 
+    const RADIUS: f64 = 1.0;
+    const ASPECT: f64 = 0.7;
+    const X_MIN: f64 = -1.2;
+    const X_MAX: f64 = 1.2;
+    const Y_MIN: f64 = -1.2;
+    const Y_MAX: f64 = 1.2;
+
+    let mut segments = Vec::new();
     let mut start_angle = 0.0;
-    for entry in entries {
-        if entry.fraction <= 0.0 {
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.fraction <= f64::EPSILON {
             continue;
         }
-        let end_angle = start_angle + entry.fraction * TAU;
-        let slice = FilledSlice::new(start_angle, end_angle, 1.0, entry.color);
-        ctx.draw(&slice);
-
-        let mid_angle = start_angle + (end_angle - start_angle) / 2.0;
-        let label_radius = 0.8;
-        let label = format!(
-            "{} ({:.0}%)",
-            truncate_label(&entry.label, 10),
-            entry.fraction * 100.0
-        );
-        ctx.print(
-            label_radius * mid_angle.cos(),
-            label_radius * mid_angle.sin(),
-            label,
-        );
-
-        let divider = CanvasLine::new(0.0, 0.0, mid_angle.cos(), mid_angle.sin(), Color::White);
-        ctx.draw(&divider);
-
+        let mut end_angle = start_angle + entry.fraction * TAU;
+        if idx == entries.len() - 1 {
+            end_angle = TAU;
+        }
+        segments.push((start_angle, end_angle, entry.color));
         start_angle = end_angle;
     }
 
-    let outline = Circle {
-        x: 0.0,
-        y: 0.0,
-        radius: 1.0,
-        color: Color::White,
-    };
-    ctx.draw(&outline);
+    if segments.is_empty() {
+        return;
+    }
+
+    let width = area.width.max(1) as usize;
+    let height = area.height.max(1) as usize;
+    let x_span = X_MAX - X_MIN;
+    let y_span = Y_MAX - Y_MIN;
+
+    {
+        let mut painter = Painter::from(&mut *ctx);
+        for row in 0..height {
+            let y = Y_MAX - (row as f64 + 0.5) / height as f64 * y_span;
+            let scaled_y = y / ASPECT;
+            let ellipse_y = (scaled_y / RADIUS).powi(2);
+            if ellipse_y > 1.0 {
+                continue;
+            }
+
+            for col in 0..width {
+                let x = X_MIN + (col as f64 + 0.5) / width as f64 * x_span;
+                let ellipse_x = (x / RADIUS).powi(2);
+                if ellipse_x + ellipse_y > 1.0 + f64::EPSILON {
+                    continue;
+                }
+
+                let mut angle = scaled_y.atan2(x);
+                if angle < 0.0 {
+                    angle += TAU;
+                }
+
+                let color = color_for_angle(angle, &segments);
+                painter.paint(col, row, color);
+            }
+        }
+    }
+
+    ctx.draw(&PieOutline::new(RADIUS, ASPECT, Color::Gray));
+}
+
+fn color_for_angle(angle: f64, segments: &[(f64, f64, Color)]) -> Color {
+    for (idx, (start, end, color)) in segments.iter().enumerate() {
+        if angle < *start {
+            continue;
+        }
+
+        let is_last = idx + 1 == segments.len();
+        if angle < *end || (is_last && angle <= *end + 1e-6) {
+            return *color;
+        }
+    }
+
+    segments
+        .last()
+        .map(|(_, _, color)| *color)
+        .unwrap_or(Color::White)
 }
 
 fn truncate_label(label: &str, max_chars: usize) -> String {
@@ -1077,35 +1121,31 @@ fn compare_cells(left: Option<&String>, right: Option<&String>) -> Ordering {
     left.cmp(right)
 }
 
-#[derive(Debug)]
-struct FilledSlice {
-    points: Vec<(f64, f64)>,
+#[derive(Debug, Clone, Copy)]
+struct PieOutline {
+    radius: f64,
+    aspect: f64,
     color: Color,
 }
 
-impl FilledSlice {
-    fn new(start_angle: f64, end_angle: f64, radius: f64, color: Color) -> Self {
-        let mut points = Vec::new();
-        let angle_steps = ((end_angle - start_angle).abs() * 60.0).ceil() as usize;
-        let angle_steps = angle_steps.max(2);
-        let radial_steps = 20;
-
-        for step in 0..=angle_steps {
-            let angle = start_angle + (end_angle - start_angle) * step as f64 / angle_steps as f64;
-            for r_step in 0..=radial_steps {
-                let r = radius * r_step as f64 / radial_steps as f64;
-                points.push((r * angle.cos(), r * angle.sin()));
-            }
+impl PieOutline {
+    fn new(radius: f64, aspect: f64, color: Color) -> Self {
+        Self {
+            radius,
+            aspect,
+            color,
         }
-
-        Self { points, color }
     }
 }
 
-impl Shape for FilledSlice {
+impl Shape for PieOutline {
     fn draw(&self, painter: &mut Painter) {
-        for (x, y) in &self.points {
-            if let Some((px, py)) = painter.get_point(*x, *y) {
+        let steps = 200;
+        for step in 0..=steps {
+            let angle = TAU * step as f64 / steps as f64;
+            let x = self.radius * angle.cos();
+            let y = self.radius * angle.sin() * self.aspect;
+            if let Some((px, py)) = painter.get_point(x, y) {
                 painter.paint(px, py, self.color);
             }
         }
