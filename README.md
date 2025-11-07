@@ -5,6 +5,8 @@
 [Ratatui]: https://ratatui.rs
 [crossterm]: https://crates.io/crates/crossterm
 
+![csvtui screenshot](asset/snapshot.png)
+
 ## Features
 
 - Load any CSV file by passing its path on the command line.
