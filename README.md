@@ -12,6 +12,7 @@
 - Highlight the active cell, column, or row while navigating with the arrow keys.
 - Sort rows by the focused column (press `Enter` on the header) and reset back to CSV order.
 - Visualize numeric or categorical data with line, histogram, and pie charts that follow the selected column.
+- Run regex-based searches globally or within the focused column, with instant match highlighting and Enter-driven navigation between hits.
 
 ## Requirements
 
@@ -32,11 +33,15 @@ If no CSV path is supplied, the application starts in read-only mode and prompts
 | `←` `→` `↑` `↓` | Move the active cell |
 | `Home` / `End` | Jump to the first / last column |
 | `PageUp` / `PageDown` | Scroll 10 rows at a time |
-| `Enter` | Sort by the active column when the header row is selected |
+| `Enter` | Sort by the active column when the header row is selected; otherwise cycle through search matches |
 | `Tab` | Cycle through line → histogram → pie charts |
 | `1` `2` `3` | Jump directly to line, histogram, or pie chart |
 | `r` | Reset to the original CSV ordering |
-| `q` `Esc` `Ctrl+C` | Quit |
+| `/` | Start a regex search (global by default, column-scoped when a column is selected) |
+| `Esc` | First press clears the active cell/column selection, second press quits |
+| `q` `Ctrl+C` | Quit |
+
+When entering search mode (`/`), type any valid Rust/PCRE-style regex. Matches are highlighted in the table, scoped either globally or to the focused column, and pressing `Enter` advances to the next occurrence in a loop. The live search prompt appears next to the file name with a blinking caret so you can see what you are typing.
 
 Charts will only render when the focused column contains compatible data (numeric for line/histogram, categorical for pie).
 
@@ -49,3 +54,5 @@ Charts will only render when the focused column contains compatible data (numeri
 ## License
 
 Licensed under the MIT License ([LICENSE](LICENSE)).
+
+Powered by Codex.

@@ -1,9 +1,10 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     f64::consts::TAU,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use color_eyre::Result;
@@ -20,6 +21,7 @@ use ratatui::{
         canvas::{Canvas, Context as CanvasContext, Painter, Shape},
     },
 };
+use regex::Regex;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -56,6 +58,81 @@ impl ChartMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScope {
+    Global,
+    Column(usize),
+}
+
+impl SearchScope {
+    fn label(self, headers: &[String]) -> String {
+        match self {
+            SearchScope::Global => "Global".to_string(),
+            SearchScope::Column(idx) => headers
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| format!("Column {}", idx.saturating_add(1))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum InputMode {
+    Normal,
+    Searching(SearchInput),
+}
+
+#[derive(Debug, Clone)]
+struct SearchInput {
+    scope: SearchScope,
+    buffer: String,
+}
+
+impl SearchInput {
+    fn new(scope: SearchScope) -> Self {
+        Self {
+            scope,
+            buffer: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CellPosition {
+    row: usize,
+    col: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchResults {
+    scope: SearchScope,
+    pattern: String,
+    matches: Vec<CellPosition>,
+    match_lookup: HashSet<CellPosition>,
+    current_index: usize,
+}
+
+impl SearchResults {
+    fn new(scope: SearchScope, pattern: String, matches: Vec<CellPosition>) -> Self {
+        let match_lookup = matches.iter().copied().collect();
+        Self {
+            scope,
+            pattern,
+            matches,
+            match_lookup,
+            current_index: 0,
+        }
+    }
+
+    fn is_match(&self, row: usize, col: usize) -> bool {
+        self.match_lookup.contains(&CellPosition { row, col })
+    }
+
+    fn len(&self) -> usize {
+        self.matches.len()
+    }
+}
+
 #[derive(Debug)]
 struct App {
     running: bool,
@@ -65,12 +142,17 @@ struct App {
     csv_path: Option<PathBuf>,
     selected_row: usize,
     selected_col: usize,
+    selection_active: bool,
     column_offset: usize,
     sort_column: Option<usize>,
     sort_ascending: bool,
     chart_mode: ChartMode,
     status_message: String,
     table_state: TableState,
+    input_mode: InputMode,
+    search_results: Option<SearchResults>,
+    search_cursor_visible: bool,
+    last_cursor_toggle: Instant,
 }
 
 impl App {
@@ -83,12 +165,17 @@ impl App {
             csv_path: None,
             selected_row: 0,
             selected_col: 0,
+            selection_active: true,
             column_offset: 0,
             sort_column: None,
             sort_ascending: true,
             chart_mode: ChartMode::Line,
             status_message: "Ready".to_string(),
             table_state: TableState::default(),
+            input_mode: InputMode::Normal,
+            search_results: None,
+            search_cursor_visible: true,
+            last_cursor_toggle: Instant::now(),
         };
 
         if let Some(path) = csv_path {
@@ -117,10 +204,25 @@ impl App {
     }
 
     fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        const TICK_RATE: Duration = Duration::from_millis(100);
+        let mut last_tick = Instant::now();
+
         self.running = true;
         while self.running {
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_crossterm_events()?;
+
+            let timeout = TICK_RATE
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or(Duration::from_millis(0));
+
+            if event::poll(timeout)? {
+                self.handle_crossterm_events()?;
+            }
+
+            if last_tick.elapsed() >= TICK_RATE {
+                self.on_tick();
+                last_tick = Instant::now();
+            }
         }
         Ok(())
     }
@@ -157,32 +259,42 @@ impl App {
             None => "File: <not loaded>".to_string(),
         };
 
-        let mut lines = vec![
-            Line::from(file_line),
-            Line::from(format!(
-                "Rows: {}  Columns: {}  Selected: row {} / col {}",
-                self.rows.len(),
-                self.headers.len(),
+        let selected_label = if self.selection_active {
+            format!(
+                "row {} / col {}",
                 self.selected_row,
-                self.selected_col.saturating_add(1),
-            )),
-            Line::from(format!(
-                "Sort: Enter on header (press 'r' to reset) | Charts: Tab to cycle (mode {}) or press 1/2/3",
-                self.chart_mode.label()
-            )),
-            Line::from(vec![
-                Span::raw("Status: "),
-                Span::styled(
-                    &self.status_message,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ];
+                self.selected_col.saturating_add(1)
+            )
+        } else {
+            "none".to_string()
+        };
+
+        let mut first_line = vec![Span::raw(file_line), Span::raw("  ")];
+        first_line.extend(self.search_spans());
+
+        let mut lines = vec![Line::from(first_line)];
+        lines.push(Line::from(format!(
+            "Rows: {}  Columns: {}  Selected: {}",
+            self.rows.len(),
+            self.headers.len(),
+            selected_label,
+        )));
+        lines.push(Line::from(format!(
+            "Sort: Enter on header (press 'r' to reset) | Charts: Tab to cycle (mode {}) or press 1/2/3",
+            self.chart_mode.label()
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("Status: "),
+            Span::styled(
+                &self.status_message,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
 
         lines.push(Line::from(
-            "Navigation: Arrow keys move (Left/Right scroll columns), Home/End jump, PgUp/PgDn faster, q or Esc quits",
+            "Navigation: Arrows move, Home/End jump, PgUp/PgDn faster, '/' starts regex search (global or column), Enter cycles matches, Esc clears selection then quits, q quits",
         ));
 
         frame.render_widget(
@@ -191,6 +303,69 @@ impl App {
                 .block(Block::bordered().title("CSV Viewer")),
             area,
         );
+    }
+
+    fn on_tick(&mut self) {
+        self.update_search_cursor();
+    }
+
+    fn update_search_cursor(&mut self) {
+        const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+        if matches!(self.input_mode, InputMode::Searching(_)) {
+            let now = Instant::now();
+            if now.duration_since(self.last_cursor_toggle) >= BLINK_INTERVAL {
+                self.search_cursor_visible = !self.search_cursor_visible;
+                self.last_cursor_toggle = now;
+            }
+        } else {
+            self.search_cursor_visible = true;
+            self.last_cursor_toggle = Instant::now();
+        }
+    }
+
+    fn search_spans(&self) -> Vec<Span<'static>> {
+        let prompt_style = Style::default().fg(Color::Cyan);
+        let input_style = Style::default().fg(Color::Green);
+        let accent_style = Style::default().fg(Color::Rgb(255, 165, 0));
+
+        match &self.input_mode {
+            InputMode::Searching(input) => {
+                let scope = input.scope.label(&self.headers);
+                let cursor = if self.search_cursor_visible { "|" } else { " " };
+                vec![
+                    Span::styled(format!("Search [{}] regex: /", scope), prompt_style),
+                    Span::styled(format!("{}{}", input.buffer, cursor), input_style),
+                ]
+            }
+            InputMode::Normal => {
+                if let Some(results) = &self.search_results {
+                    let scope = results.scope.label(&self.headers);
+                    if results.len() > 0 {
+                        vec![
+                            Span::styled(format!("Search [{}]: /", scope), prompt_style),
+                            Span::styled(results.pattern.clone(), input_style),
+                            Span::raw("  "),
+                            Span::styled(
+                                format!("match {}/{}", results.current_index + 1, results.len()),
+                                accent_style,
+                            ),
+                        ]
+                    } else {
+                        vec![
+                            Span::styled(format!("Search [{}]: /", scope), prompt_style),
+                            Span::styled(results.pattern.clone(), input_style),
+                            Span::raw("  "),
+                            Span::styled("no matches".to_string(), accent_style),
+                        ]
+                    }
+                } else {
+                    vec![Span::styled(
+                        "Search: press '/' to start regex search".to_string(),
+                        prompt_style,
+                    )]
+                }
+            }
+        }
     }
 
     fn render_table(&mut self, frame: &mut Frame, area: Rect) {
@@ -265,15 +440,29 @@ impl App {
                             .unwrap_or_default();
 
                         let mut style = Style::default();
-                        if self.selected_row == row_idx + 1 && self.selected_col == col_idx {
+                        let is_selected_cell = self.selection_active
+                            && self.selected_row == row_idx + 1
+                            && self.selected_col == col_idx;
+                        let is_selected_row = self.selection_active
+                            && self.selected_row == row_idx + 1
+                            && !is_selected_cell;
+                        let is_selected_col = self.selection_active
+                            && self.selected_col == col_idx
+                            && !is_selected_cell;
+
+                        if is_selected_cell {
                             style = style
                                 .bg(Color::Cyan)
                                 .fg(Color::Black)
                                 .add_modifier(Modifier::BOLD);
-                        } else if self.selected_row == row_idx + 1 {
+                        } else if is_selected_row {
                             style = style.bg(Color::DarkGray);
-                        } else if self.selected_col == col_idx {
+                        } else if is_selected_col {
                             style = style.bg(Color::DarkGray);
+                        }
+
+                        if !is_selected_cell && self.is_search_match(row_idx, col_idx) {
+                            style = style.fg(Color::Magenta).add_modifier(Modifier::BOLD);
                         }
 
                         Cell::from(content.to_string()).style(style)
@@ -283,20 +472,24 @@ impl App {
             })
             .collect::<Vec<_>>();
 
-        if self.selected_row == 0 {
-            self.table_state.select(None);
-        } else {
+        if self.selection_active && self.selected_row > 0 {
             self.table_state
                 .select(Some(self.selected_row.saturating_sub(1)));
-        }
-        if self.headers.is_empty() {
-            self.table_state.select_column(None);
         } else {
-            let visible_index = visible_columns
+            self.table_state.select(None);
+        }
+
+        if self.selection_active && !self.headers.is_empty() {
+            if let Some(visible_index) = visible_columns
                 .iter()
                 .position(|&idx| idx == self.selected_col)
-                .unwrap_or(0);
-            self.table_state.select_column(Some(visible_index));
+            {
+                self.table_state.select_column(Some(visible_index));
+            } else {
+                self.table_state.select_column(None);
+            }
+        } else {
+            self.table_state.select_column(None);
         }
 
         let table = Table::new(rows, widths)
@@ -599,41 +792,102 @@ impl App {
     }
 
     fn on_key_event(&mut self, key: KeyEvent) {
+        if self.handle_global_shortcuts(&key) {
+            return;
+        }
+
+        if matches!(self.input_mode, InputMode::Searching(_)) {
+            self.handle_search_key(key);
+        } else {
+            self.handle_normal_key(key);
+        }
+
+        self.ensure_selection_in_bounds();
+    }
+
+    fn handle_global_shortcuts(&mut self, key: &KeyEvent) -> bool {
         match (key.modifiers, key.code) {
-            (_, KeyCode::Esc | KeyCode::Char('q')) => self.quit(),
-            (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => self.quit(),
+            (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => {
+                self.quit();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_status("Search canceled");
+            }
+            KeyCode::Enter => self.submit_search_query(),
+            KeyCode::Backspace => {
+                if let InputMode::Searching(input) = &mut self.input_mode {
+                    input.buffer.pop();
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let InputMode::Searching(input) = &mut self.input_mode {
+                    input.buffer.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Esc) => self.handle_escape(),
+            (_, KeyCode::Char('q')) | (_, KeyCode::Char('Q')) => self.quit(),
+            (_, KeyCode::Char('/')) => self.start_search(),
             (_, KeyCode::Left) => {
                 if self.selected_col > 0 {
                     self.selected_col -= 1;
                 }
+                self.selection_active = true;
             }
             (_, KeyCode::Right) => {
                 if self.selected_col + 1 < self.column_count() {
                     self.selected_col += 1;
                 }
+                self.selection_active = true;
             }
             (_, KeyCode::Up) => {
                 if self.selected_row > 0 {
                     self.selected_row -= 1;
                 }
+                self.selection_active = true;
             }
             (_, KeyCode::Down) => {
                 if self.selected_row < self.row_count() {
                     self.selected_row += 1;
                 }
+                self.selection_active = true;
             }
-            (_, KeyCode::Home) => self.selected_col = 0,
+            (_, KeyCode::Home) => {
+                self.selected_col = 0;
+                self.selection_active = true;
+            }
             (_, KeyCode::End) => {
                 if self.column_count() > 0 {
                     self.selected_col = self.column_count() - 1;
                 }
+                self.selection_active = true;
             }
-            (_, KeyCode::PageUp) => self.selected_row = self.selected_row.saturating_sub(10),
+            (_, KeyCode::PageUp) => {
+                self.selected_row = self.selected_row.saturating_sub(10);
+                self.selection_active = true;
+            }
             (_, KeyCode::PageDown) => {
                 let max_idx = self.row_count().saturating_sub(1);
                 self.selected_row = (self.selected_row + 10).min(max_idx);
+                self.selection_active = true;
             }
             (_, KeyCode::Enter) => {
+                if self.advance_search_match() {
+                    return;
+                }
                 if self.selected_row == 0 {
                     self.sort_by_selected_column();
                 }
@@ -648,7 +902,148 @@ impl App {
             }
             _ => {}
         }
-        self.ensure_selection_in_bounds();
+    }
+
+    fn handle_escape(&mut self) {
+        if self.selection_active {
+            self.selection_active = false;
+            self.set_status("Selection cleared. Press Esc again to quit");
+        } else {
+            self.quit();
+        }
+    }
+
+    fn start_search(&mut self) {
+        let scope = if self.selection_active && self.column_count() > 0 {
+            SearchScope::Column(self.selected_col.min(self.column_count() - 1))
+        } else {
+            SearchScope::Global
+        };
+        self.input_mode = InputMode::Searching(SearchInput::new(scope));
+        self.clear_search_results();
+        self.search_cursor_visible = true;
+        self.last_cursor_toggle = Instant::now();
+        let label = scope.label(&self.headers);
+        self.set_status(format!("Search [{}]: enter regex pattern", label));
+    }
+
+    fn submit_search_query(&mut self) {
+        let (scope, pattern) = match &self.input_mode {
+            InputMode::Searching(input) => (input.scope, input.buffer.clone()),
+            InputMode::Normal => return,
+        };
+
+        if pattern.is_empty() {
+            self.set_status("Search pattern cannot be empty");
+            return;
+        }
+
+        let regex = match Regex::new(&pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                self.set_status(format!("Invalid regex: {error}"));
+                return;
+            }
+        };
+
+        self.input_mode = InputMode::Normal;
+
+        let matches = self.collect_matches(scope, &regex);
+        if matches.is_empty() {
+            self.search_results = None;
+            self.set_status(format!("No matches for /{}", pattern));
+            return;
+        }
+
+        self.search_results = Some(SearchResults::new(scope, pattern.clone(), matches));
+        self.focus_search_match(0);
+
+        if let Some(results) = &self.search_results {
+            let label = results.scope.label(&self.headers);
+            self.set_status(format!(
+                "Search [{}]: {} match{}",
+                label,
+                results.len(),
+                if results.len() == 1 { "" } else { "es" }
+            ));
+        }
+    }
+
+    fn clear_search_results(&mut self) {
+        self.search_results = None;
+    }
+
+    fn collect_matches(&self, scope: SearchScope, regex: &Regex) -> Vec<CellPosition> {
+        match scope {
+            SearchScope::Global => self
+                .rows
+                .iter()
+                .enumerate()
+                .flat_map(|(row_idx, row)| {
+                    row.iter().enumerate().filter_map(move |(col_idx, value)| {
+                        if regex.is_match(value) {
+                            Some(CellPosition {
+                                row: row_idx,
+                                col: col_idx,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect(),
+            SearchScope::Column(col) => self
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row_idx, row)| {
+                    row.get(col).and_then(|value| {
+                        if regex.is_match(value) {
+                            Some(CellPosition { row: row_idx, col })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn focus_search_match(&mut self, index: usize) {
+        if let Some(results) = self.search_results.as_mut() {
+            if results.matches.is_empty() {
+                return;
+            }
+            let idx = index % results.matches.len();
+            results.current_index = idx;
+            if let Some(target) = results.matches.get(idx).copied() {
+                self.selection_active = true;
+                self.selected_row = target.row.saturating_add(1);
+                self.selected_col = target.col;
+                self.ensure_selection_in_bounds();
+            }
+        }
+    }
+
+    fn advance_search_match(&mut self) -> bool {
+        let next_index = match self.search_results.as_ref() {
+            Some(results) if !results.matches.is_empty() => {
+                (results.current_index + 1) % results.matches.len()
+            }
+            _ => return false,
+        };
+
+        self.focus_search_match(next_index);
+        if let Some(results) = &self.search_results {
+            let label = results.scope.label(&self.headers);
+            self.set_status(format!(
+                "Search [{}]: match {}/{}",
+                label,
+                results.current_index + 1,
+                results.len()
+            ));
+        }
+        true
     }
 
     fn set_chart_mode(&mut self, mode: ChartMode) {
@@ -669,6 +1064,7 @@ impl App {
             true
         };
 
+        self.clear_search_results();
         self.rows
             .sort_by(|a, b| compare_cells(a.get(column), b.get(column)));
         if !ascending {
@@ -702,6 +1098,7 @@ impl App {
             return;
         }
 
+        self.clear_search_results();
         self.rows = self.original_rows.clone();
         self.sort_column = None;
         self.sort_ascending = true;
@@ -769,7 +1166,7 @@ impl App {
 
         let total: u64 = counts.values().sum();
         let mut entries = counts.into_iter().collect::<Vec<_>>();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         const MAX_SEGMENTS: usize = 8;
         let mut result = Vec::new();
@@ -811,6 +1208,13 @@ impl App {
         }
 
         widths
+    }
+
+    fn is_search_match(&self, row_idx: usize, col_idx: usize) -> bool {
+        self.search_results
+            .as_ref()
+            .map(|results| results.is_match(row_idx, col_idx))
+            .unwrap_or(false)
     }
 
     fn adjust_column_offset(&mut self, area_width: u16, column_widths: &[u16]) {
